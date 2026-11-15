@@ -1,0 +1,67 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: clippy, rustfmt
+
+      - run: cargo fmt --check
+
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+      - run: cargo test --locked
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: linux-x64
+            file: libhttrack_adblock.so
+          - runner: ubuntu-24.04-arm
+            name: linux-arm64
+            file: libhttrack_adblock.so
+          - runner: windows-latest
+            name: windows-x64
+            file: httrack_adblock.dll
+          - runner: windows-11-arm
+            name: windows-arm64
+            file: httrack_adblock.dll
+          - runner: macos-latest
+            name: macos-arm64
+            file: libhttrack_adblock.dylib
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: httrack-adblock-${{ matrix.name }}
+          path: target/release/${{ matrix.file }}
+          if-no-files-found: error

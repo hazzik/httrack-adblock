@@ -1,0 +1,35 @@
+[package]
+name = "httrack_adblock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adblock = "0.13.5"
+chardetng = "1.0.0"
+encoding_rs = "0.8"
+html5ever = "0.40.1"
+percent-encoding = "2.3.2"
+regex = "1.13.1"
+scraper = { version = "0.29.0", default-features = false }
+url = "2.5.8"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+as_conversions = "warn"
+cognitive_complexity = "deny"
+doc_markdown = "warn"
+single_match_else = "warn"
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
