@@ -262,11 +262,7 @@ pub unsafe extern "C" fn hts_plug(opt: *mut HttrackOpt, argv: *const c_char) -> 
     // SAFETY: the caller passes HTTrack's options, which stay valid during the call, and null or a
     // NUL-terminated `argv`.
     let (opts, argv) = unsafe { (Options::new(opt), c_string(argv)) };
-    if callbacks::hts_plug(opts, argv).is_some() {
-        1
-    } else {
-        0
-    }
+    c_int::from(callbacks::hts_plug(opts, argv).is_some())
 }
 
 /// HTTrack calls it from `hts_free_opt` at the end of each mirror, and the
@@ -355,7 +351,12 @@ unsafe extern "C" fn on_linkdetected2(
     // `tag` that is not null points into the page that HTTrack parses, which ends with a NUL byte, as
     // `htsdefines.h` says for `preprocess-html`.
     let (link, tag) = unsafe { (c_string(link), tag_bytes(tag)) };
-    if callbacks::on_linkdetected2(link, tag) { 0 } else { 1 }
+    c_int::from(!callbacks::on_linkdetected2(link, tag))
+}
+
+/// A `verdict` of -1 means that no earlier callback decided, so HTTrack's `status` stands.
+fn is_refused(verdict: c_int, status: c_int) -> bool {
+    verdict == 1 || (verdict == -1 && status == 1)
 }
 
 unsafe extern "C" fn on_check_link(
@@ -372,8 +373,7 @@ unsafe extern "C" fn on_check_link(
     };
     // SAFETY: HTTrack passes null or NUL-terminated strings that stay valid during the callback.
     let (adr, fil) = unsafe { (c_string(adr), c_string(fil)) };
-    let refused = verdict == 1 || (verdict == -1 && status == 1);
-    if callbacks::on_check_link(adr, fil, refused) {
+    if callbacks::on_check_link(adr, fil, is_refused(verdict, status)) {
         1
     } else {
         verdict
@@ -426,11 +426,10 @@ unsafe extern "C" fn on_check_mime(
         Some(prev) => unsafe { prev(carg, opt, adr, fil, mime, status) },
         None => -1,
     };
-    let refused = verdict == 1 || (verdict == -1 && status == 1);
     // SAFETY: HTTrack passes its options and null or NUL-terminated strings, which stay valid during
     // the callback.
     let (opts, adr, fil, mime) = unsafe { (Options::new(opt), c_string(adr), c_string(fil), c_string(mime)) };
-    if !refused {
+    if !is_refused(verdict, status) {
         let _ = catch_unwind(AssertUnwindSafe(|| callbacks::on_check_mime(opts, adr, fil, mime)));
     }
     verdict

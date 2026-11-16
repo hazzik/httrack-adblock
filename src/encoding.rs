@@ -29,12 +29,10 @@ pub(crate) fn parse(body: &[u8], page: &Url, declared: Option<&'static Encoding>
         let (encoding, text) = decode(encoding, body);
         return (encoding, Html::parse_document(&text));
     }
-    let guess = if std::str::from_utf8(body).is_ok() {
-        UTF_8
-    } else {
-        guess(body, page)
+    let (guess, text) = match std::str::from_utf8(body) {
+        Ok(text) => (UTF_8, Cow::Borrowed(text)),
+        Err(_) => decode(guess(body, page), body),
     };
-    let (guess, text) = decode(guess, body);
     let doc = Html::parse_document(&text);
     match meta_encoding(&doc) {
         Some(meta) if meta != guess => {

@@ -13,7 +13,7 @@ use crate::encoding;
 use crate::filters::LoadError;
 use crate::headers::Response;
 use crate::httrack::{Options, forget_previous_callbacks, register_callbacks};
-use crate::links::{PAGE_LINK_TYPES, page_url, request_types_for_tag, tag_name, with_path_type};
+use crate::links::{PAGE_LINK_TYPES, page_url, request_types_for_tag, tag_name};
 use crate::page;
 use crate::state::{self, STATE, State};
 
@@ -41,8 +41,7 @@ const PRIMARY_FIL: &[u8] = b"/primary";
 /// `hts_unplug` after a failed `hts_plug` too.
 static PLUGS: AtomicUsize = AtomicUsize::new(0);
 
-/// `argv` is the plugin path and the comma-separated list paths. Returns `None` when the plugin
-/// cannot run.
+/// Returns `None` when the plugin cannot run.
 pub(crate) fn hts_plug(opts: Options<'_>, argv: Option<&CStr>) -> Option<()> {
     let first = PLUGS.fetch_add(1, Ordering::Relaxed) == 0;
     let loaded = catch_unwind(|| load(argv)).ok()?;
@@ -69,8 +68,6 @@ fn load(argv: Option<&CStr>) -> Result<Option<State>, LoadError> {
     state::load(STATE.get().as_deref(), lists)
 }
 
-/// HTTrack calls `hts_unplug` from `hts_free_opt` at the end of each mirror, and the
-/// operating system can keep the plugin loaded for the next mirror.
 pub(crate) fn hts_unplug() {
     if PLUGS.fetch_sub(1, Ordering::Relaxed) == 1 {
         STATE.set(None);
@@ -106,7 +103,7 @@ pub(crate) fn on_preprocess(
 fn is_html(state: &State, opts: Options<'_>, page: &Url, fil: &[u8], buffer: &[u8]) -> bool {
     let reported = state.mime_types.borrow_mut().remove(page.as_str());
     match reported {
-        Some(mime) => mime == HTML_MIME,
+        Some(is_html) => is_html,
         None => opts.name_is_html(fil).unwrap_or(true) && page::starts_like_markup(buffer),
     }
 }
@@ -119,29 +116,21 @@ pub(crate) fn on_linkdetected2(link: Option<&CStr>, tag: Option<&[u8]>) -> bool 
         let Some(tag) = tag else {
             // `htsAddLink` adds links from sitemaps and Java classes, and no callback
             // tells which file they came from. HTTrack treats a sitemap link as a start URL.
-            let url = Url::parse(&link).ok()?;
-            return Some(
-                with_path_type(PAGE_LINK_TYPES, &link)
-                    .into_iter()
-                    .any(|t| state.filters.blocks(&url, &url, t)),
-            );
+            return Some(state.filters.blocks_link(&link, None, None, PAGE_LINK_TYPES));
         };
+        let name = tag_name(tag);
         // HTTrack does not download a `<base href>`, and it ignores one that a callback
         // refused, which would resolve the page's links against the wrong URL.
-        if tag_name(tag) == b"base" {
+        if name == b"base" {
             state.set_base(&link);
             return Some(false);
         }
         let tag_types = if state.page.borrow().is_none() {
             PAGE_LINK_TYPES
         } else {
-            request_types_for_tag(tag)
+            request_types_for_tag(&name, tag)
         };
-        Some(
-            with_path_type(tag_types, &link)
-                .into_iter()
-                .any(|t| state.blocks_link(&link, t)),
-        )
+        Some(state.blocks_link(&link, tag_types))
     })
 }
 
@@ -149,16 +138,15 @@ pub(crate) fn on_linkdetected2(link: Option<&CStr>, tag: Option<&[u8]>) -> bool 
 /// checked page links.
 pub(crate) fn on_check_link(adr: Option<&CStr>, fil: Option<&CStr>, refused: bool) -> bool {
     count_blocked(|state| {
+        if state.redirects.borrow().is_empty() {
+            return None;
+        }
         let url = page_url(adr?.to_bytes(), fil?.to_bytes())?;
         let source = state.redirects.borrow_mut().remove(url.as_str())?;
         if refused {
             return None;
         }
-        Some(
-            with_path_type(PAGE_LINK_TYPES, url.path())
-                .into_iter()
-                .any(|t| state.filters.blocks(&url, &source, t)),
-        )
+        Some(state.filters.blocks(&url, &source, PAGE_LINK_TYPES))
     })
 }
 
@@ -208,7 +196,7 @@ fn record_redirect(state: &State, from: &Url, location: &[u8], source: Url) -> O
 
 fn record_encoding(state: &State, page: Url, content_type: &[u8]) -> Option<()> {
     let (mime, parameters) = std::str::from_utf8(content_type).ok()?.split_once(';')?;
-    if !PARSED_MIME_TYPES.contains(&mime.trim().to_ascii_lowercase().as_str()) {
+    if !is_parsed_mime(mime.trim()) {
         return None;
     }
     let encoding = encoding::from_content_type(parameters.as_bytes())?;
@@ -225,17 +213,22 @@ pub(crate) fn on_check_mime(
 ) -> Option<()> {
     let state = STATE.get()?;
     let mime = mime?;
-    let name = mime.to_str().ok()?.split(';').next()?.trim().to_ascii_lowercase();
-    // HTTrack guesses these from the file name, and so does `is_html`.
-    if name == HTS_UNKNOWN_MIME || opts.may_unknown(mime) {
+    let name = mime.to_str().ok()?.split(';').next()?.trim();
+    if !is_parsed_mime(name) {
         return None;
     }
-    if !PARSED_MIME_TYPES.contains(&name.as_str()) {
+    // HTTrack guesses these from the file name, and so does `is_html`.
+    if name.eq_ignore_ascii_case(HTS_UNKNOWN_MIME) || opts.may_unknown(mime) {
         return None;
     }
     let url = page_url(adr?.to_bytes(), fil?.to_bytes())?;
-    state.mime_types.borrow_mut().insert(url.into(), name);
+    let is_html = name.eq_ignore_ascii_case(HTML_MIME);
+    state.mime_types.borrow_mut().insert(url.into(), is_html);
     Some(())
+}
+
+fn is_parsed_mime(mime: &str) -> bool {
+    PARSED_MIME_TYPES.iter().any(|parsed| mime.eq_ignore_ascii_case(parsed))
 }
 
 pub(crate) fn on_end() {

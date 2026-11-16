@@ -23,8 +23,8 @@ pub(crate) struct State {
     pub(crate) redirects: RefCell<HashMap<String, Url>>,
     /// Page URL -> charset from the `Content-Type` header.
     pub(crate) header_encodings: RefCell<HashMap<String, &'static Encoding>>,
-    /// Page URL -> MIME type from `check-mime`.
-    pub(crate) mime_types: RefCell<HashMap<String, String>>,
+    /// Page URL -> whether `check-mime` reported `text/html`.
+    pub(crate) mime_types: RefCell<HashMap<String, bool>>,
     pub(crate) stats: Stats,
 }
 
@@ -43,12 +43,12 @@ impl State {
     }
 
     /// `link` is relative to the current page's base URL.
-    pub(crate) fn blocks_link(&self, link: &str, request_type: RequestType) -> bool {
+    pub(crate) fn blocks_link(&self, link: &str, request_types: &[RequestType]) -> bool {
         self.filters.blocks_link(
             link,
             self.base.borrow().as_ref(),
             self.page.borrow().as_ref(),
-            request_type,
+            request_types,
         )
     }
 
@@ -93,7 +93,7 @@ pub(crate) static STATE: Global<State> = Global::new();
 /// Adds the lists in `new_paths` to the lists of earlier `-%W` options, which
 /// `httrack --update` repeats from `hts-cache/doit.log`. Returns `None` when `new_paths` adds no list.
 pub(crate) fn load(previous: Option<&State>, new_paths: &str) -> Result<Option<State>, LoadError> {
-    let mut paths = previous.map_or_else(BTreeSet::new, |state| state.filters.paths().clone());
+    let mut paths = previous.map_or_else(BTreeSet::new, |state| state.filters.paths.clone());
     let known = paths.len();
     for path in new_paths.split(',').filter(|p| !p.is_empty()) {
         filters::add_list_files(Path::new(path), &mut paths)?;

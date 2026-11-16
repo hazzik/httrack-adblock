@@ -11,21 +11,14 @@ use scraper::{ElementRef, Html, Node, Selector, StrTendril};
 use url::Url;
 
 use crate::encoding::{self, UTF_8_BOM};
-use crate::links::RequestType;
+use crate::links::{RequestType, request_types_for_element};
 use crate::state::State;
 
 static SCRIPT_BLOCKS: LazyLock<Selector> = LazyLock::new(|| selector("script, noscript"));
 static BASE_HREF: LazyLock<Selector> = LazyLock::new(|| selector("base[href]"));
 static LEADING_NEWLINE: LazyLock<Selector> = LazyLock::new(|| selector("pre, textarea, listing"));
-/// Elements whose `src` the plugin checks, and the request type of that `src`.
-static SOURCES: LazyLock<[(Selector, RequestType); 4]> = LazyLock::new(|| {
-    [
-        (selector("img[src]"), RequestType::Image),
-        (selector("iframe[src]"), RequestType::SubFrame),
-        (selector("frame[src]"), RequestType::SubFrame),
-        (selector("embed[src]"), RequestType::Object),
-    ]
-});
+/// Elements whose `src` the plugin checks.
+static SOURCES: LazyLock<Selector> = LazyLock::new(|| selector("img[src], iframe[src], frame[src], embed[src]"));
 static URL_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:https?:)?//[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d+)?(?:/[^\s"'<>\\()]*)?"#)
         .expect("the regex is valid")
@@ -57,19 +50,15 @@ pub(crate) fn process(
     if page.remove_blocked(&mut doc) == 0 {
         return None;
     }
-    keep_leading_newlines(&mut doc);
     let mut out = bom.to_vec();
-    out.extend_from_slice(&encoding.encode(&to_html(&doc)).0);
+    out.extend_from_slice(&encoding.encode(&to_html(doc)).0);
     Some(out)
 }
 
 /// HTTrack also passes scripts, style sheets and SVG images to `preprocess-html`.
 pub(crate) fn starts_like_markup(buffer: &[u8]) -> bool {
     let rest = buffer.strip_prefix(UTF_8_BOM).unwrap_or(buffer);
-    let start = rest
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .map_or(&[][..], |i| &rest[i..]);
+    let start = rest.trim_ascii_start();
     start.starts_with(b"<") && !starts_with_ci(start, b"<?xml") && !starts_with_ci(start, b"<svg")
 }
 
@@ -86,16 +75,16 @@ struct Page<'a> {
 }
 
 impl Page<'_> {
-    fn blocks(&self, link: &str, request_type: RequestType) -> bool {
+    fn blocks(&self, link: &str, request_types: &[RequestType]) -> bool {
         self.state
             .filters
-            .blocks_link(link, self.base.as_ref(), Some(self.url), request_type)
+            .blocks_link(link, self.base.as_ref(), Some(self.url), request_types)
     }
 
     fn mentions_blocked_url(&self, text: &str, request_types: &[RequestType]) -> bool {
         URL_IN_TEXT
             .find_iter(text)
-            .any(|m| request_types.iter().any(|&t| self.blocks(m.as_str(), t)))
+            .any(|m| self.blocks(m.as_str(), request_types))
     }
 
     fn html_rule_matches<'d>(&self, doc: &'d Html) -> Vec<ElementRef<'d>> {
@@ -107,8 +96,10 @@ impl Page<'_> {
             .filter(|rule| rule.applies(host))
             .flat_map(|rule| {
                 doc.select(&rule.css).filter(|el| {
-                    let text: String = el.text().collect();
-                    rule.texts.iter().all(|t| t.matches(&text))
+                    rule.texts.is_empty() || {
+                        let text: String = el.text().collect();
+                        rule.texts.iter().all(|t| t.matches(&text))
+                    }
                 })
             })
             .collect()
@@ -122,9 +113,11 @@ impl Page<'_> {
                     && el
                         .value()
                         .attr("src")
-                        .is_some_and(|src| self.blocks(src, RequestType::Script));
-                let text: String = el.text().collect();
-                blocked_src || self.mentions_blocked_url(&text, &[RequestType::Script, RequestType::Image])
+                        .is_some_and(|src| self.blocks(src, &[RequestType::Script]));
+                blocked_src || {
+                    let text: String = el.text().collect();
+                    self.mentions_blocked_url(&text, &[RequestType::Script, RequestType::Image])
+                }
             })
             .collect()
     }
@@ -137,8 +130,8 @@ impl Page<'_> {
             let mut classes = HashSet::new();
             let mut ids = HashSet::new();
             for el in doc.root_element().descendants().filter_map(ElementRef::wrap) {
-                classes.extend(el.value().classes().map(str::to_owned));
-                ids.extend(el.value().id().map(str::to_owned));
+                classes.extend(el.value().classes());
+                ids.extend(el.value().id());
             }
             selectors.extend(engine.hidden_class_id_selectors(&classes, &ids, &resources.exceptions));
         }
@@ -147,14 +140,12 @@ impl Page<'_> {
 
     /// Elements in `SOURCES` whose `src` is blocked.
     fn blocked_sources<'d>(&self, doc: &'d Html) -> Vec<ElementRef<'d>> {
-        SOURCES
-            .iter()
-            .flat_map(|(selector, request_type)| {
-                doc.select(selector).filter(|el| {
-                    el.value()
-                        .attr("src")
-                        .is_some_and(|src| self.blocks(src, *request_type))
-                })
+        doc.select(&SOURCES)
+            .filter(|el| {
+                let request_types = request_types_for_element(el.value().name().as_bytes());
+                el.value()
+                    .attr("src")
+                    .is_some_and(|src| self.blocks(src, request_types))
             })
             .collect()
     }
@@ -183,10 +174,9 @@ impl Page<'_> {
             let Some(node) = doc.tree.get(id) else {
                 continue;
             };
-            if removed.contains(&id) || node.ancestors().any(|a| marked.contains(&a.id())) {
+            if node.ancestors().any(|a| marked.contains(&a.id())) || !removed.insert(id) {
                 continue;
             }
-            removed.insert(id);
             if let Some(mut node) = doc.tree.get_mut(id) {
                 node.detach();
             }
@@ -226,9 +216,10 @@ fn keep_leading_newlines(doc: &mut Html) {
 }
 
 /// `Html::html()` escapes `<noscript>` content and drops the doctype's public and system IDs.
-fn to_html(doc: &Html) -> String {
+fn to_html(mut doc: Html) -> String {
+    keep_leading_newlines(&mut doc);
     let mut out = Vec::new();
-    write_html(doc, &mut out).expect("writing to a `Vec` does not fail");
+    write_html(&doc, &mut out).expect("writing to a `Vec` does not fail");
     String::from_utf8(out).expect("html5ever writes UTF-8")
 }
 
@@ -290,14 +281,12 @@ mod tests {
     fn to_html_keeps_the_doctype_ids_and_top_comments() {
         let html = "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\
                     <!--top--><html><head></head><body><noscript><b>x</b></noscript></body></html>";
-        let doc = Html::parse_document(html);
-        assert_eq!(to_html(&doc), html);
+        assert_eq!(to_html(Html::parse_document(html)), html);
     }
 
     #[test]
-    fn keep_leading_newlines_writes_back_the_newline_after_pre() {
-        let mut doc = Html::parse_document("<pre>\n\nx</pre>");
-        keep_leading_newlines(&mut doc);
-        assert!(to_html(&doc).contains("<pre>\n\nx</pre>"));
+    fn to_html_writes_back_the_newline_after_pre() {
+        let doc = Html::parse_document("<pre>\n\nx</pre>");
+        assert!(to_html(doc).contains("<pre>\n\nx</pre>"));
     }
 }

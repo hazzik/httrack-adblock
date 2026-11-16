@@ -3,35 +3,7 @@
 use percent_encoding::{AsciiSet, percent_encode};
 use url::Url;
 
-/// The request types that the `adblock` crate knows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RequestType {
-    Document,
-    Font,
-    Image,
-    Media,
-    Object,
-    Other,
-    Script,
-    Stylesheet,
-    SubFrame,
-}
-
-impl RequestType {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Document => "document",
-            Self::Font => "font",
-            Self::Image => "image",
-            Self::Media => "media",
-            Self::Object => "object",
-            Self::Other => "other",
-            Self::Script => "script",
-            Self::Stylesheet => "stylesheet",
-            Self::SubFrame => "sub_frame",
-        }
-    }
-}
+pub(crate) use adblock::request::RequestType;
 
 /// HTTrack follows every link, so the plugin checks a page link as a page and as any file.
 pub(crate) const PAGE_LINK_TYPES: &[RequestType] = &[RequestType::Document, RequestType::Other];
@@ -65,15 +37,11 @@ pub(crate) fn tag_name(tag: &[u8]) -> Vec<u8> {
 /// HTTrack's `link_has_authority`.
 pub(crate) fn has_authority(link: &str) -> bool {
     let rest = link.trim_start_matches(|c: char| c.is_ascii_alphabetic());
-    let rest = if rest.len() == link.len() {
-        rest
+    if rest.len() == link.len() {
+        rest.starts_with("//")
     } else {
-        let Some(rest) = rest.strip_prefix(':') else {
-            return false;
-        };
-        rest
-    };
-    rest.starts_with("//")
+        rest.starts_with("://")
+    }
 }
 
 /// HTTrack's `link_base_is_hostname`.
@@ -85,13 +53,20 @@ pub(crate) fn base_is_hostname(link: &str) -> bool {
             .any(|c| matches!(c, '.' | ':'))
 }
 
-/// The plugin blocks the link when a rule blocks any of these types.
-pub(crate) fn request_types_for_tag(tag: &[u8]) -> &'static [RequestType] {
-    match tag_name(tag).as_slice() {
+/// The plugin blocks the link when a rule blocks any of these types. `name` is `tag_name(tag)`.
+pub(crate) fn request_types_for_tag(name: &[u8], tag: &[u8]) -> &'static [RequestType] {
+    if name == b"link" && find_ci(tag, b"stylesheet").is_some() {
+        return &[RequestType::Stylesheet];
+    }
+    request_types_for_element(name)
+}
+
+/// The request types of a link in the element with the lowercase name `name`.
+pub(crate) fn request_types_for_element(name: &[u8]) -> &'static [RequestType] {
+    match name {
         b"script" => &[RequestType::Script],
         b"img" | b"image" | b"input" => &[RequestType::Image],
-        b"link" if find_ci(tag, b"stylesheet").is_some() => &[RequestType::Stylesheet],
-        b"iframe" | b"frame" => &[RequestType::SubFrame],
+        b"iframe" | b"frame" => &[RequestType::Subdocument],
         b"embed" | b"object" => &[RequestType::Object],
         b"audio" | b"video" | b"source" => &[RequestType::Media],
         b"a" | b"area" => PAGE_LINK_TYPES,
@@ -100,19 +75,18 @@ pub(crate) fn request_types_for_tag(tag: &[u8]) -> &'static [RequestType] {
 }
 
 /// A tag that allows `Other` does not decide the type, so the file extension adds one.
-pub(crate) fn with_path_type(types: &[RequestType], link: &str) -> Vec<RequestType> {
-    let mut types = types.to_vec();
-    let from_path = request_type_for_path(link);
-    if types.contains(&RequestType::Other) && !types.contains(&from_path) {
-        types.push(from_path);
-    }
-    types
+pub(crate) fn with_path_type(types: &[RequestType], path: &str) -> impl Iterator<Item = RequestType> {
+    let from_path = types
+        .contains(&RequestType::Other)
+        .then(|| request_type_for_path(path))
+        .filter(|t| !types.contains(t));
+    types.iter().cloned().chain(from_path)
 }
 
 fn request_type_for_path(path: &str) -> RequestType {
-    let path = path.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
-    let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
-    match ext {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let ext = path.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    match ext.as_str() {
         "js" | "mjs" => RequestType::Script,
         "css" => RequestType::Stylesheet,
         "png" | "gif" | "jpg" | "jpeg" | "webp" | "svg" | "ico" | "bmp" => RequestType::Image,
@@ -162,22 +136,21 @@ mod tests {
 
     #[test]
     fn request_types_for_tag_reads_the_tag_name() {
-        assert_eq!(request_types_for_tag(b"<script src="), [RequestType::Script]);
-        assert_eq!(
-            request_types_for_tag(b"<link rel=\"StyleSheet\" href="),
-            [RequestType::Stylesheet]
-        );
-        assert_eq!(request_types_for_tag(b"<link rel=\"icon\" href="), [RequestType::Other]);
-        assert_eq!(request_types_for_tag(b"<a href="), PAGE_LINK_TYPES);
+        let types = |tag: &[u8]| request_types_for_tag(&tag_name(tag), tag);
+        assert_eq!(types(b"<script src="), [RequestType::Script]);
+        assert_eq!(types(b"<link rel=\"StyleSheet\" href="), [RequestType::Stylesheet]);
+        assert_eq!(types(b"<link rel=\"icon\" href="), [RequestType::Other]);
+        assert_eq!(types(b"<a href="), PAGE_LINK_TYPES);
     }
 
     #[test]
     fn with_path_type_adds_the_type_of_the_extension_to_other() {
+        let types = |types: &[RequestType], link| with_path_type(types, link).collect::<Vec<_>>();
         assert_eq!(
-            with_path_type(&[RequestType::Other], "/x.JS?v=1"),
+            types(&[RequestType::Other], "/x.JS?v=1"),
             [RequestType::Other, RequestType::Script]
         );
-        assert_eq!(with_path_type(&[RequestType::Other], "/page"), [RequestType::Other]);
-        assert_eq!(with_path_type(&[RequestType::Image], "/x.js"), [RequestType::Image]);
+        assert_eq!(types(&[RequestType::Other], "/page"), [RequestType::Other]);
+        assert_eq!(types(&[RequestType::Image], "/x.js"), [RequestType::Image]);
     }
 }

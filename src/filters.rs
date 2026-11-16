@@ -9,12 +9,12 @@ use adblock::lists::{FilterSet, ParseOptions};
 use adblock::request::Request;
 use url::Url;
 
-use crate::links::RequestType;
+use crate::links::{RequestType, with_path_type};
 use crate::rules::{Domains, HtmlRule, parse_html_rule};
 
 pub(crate) struct Filters {
     /// Canonical paths, from every `-%W`.
-    paths: BTreeSet<PathBuf>,
+    pub(crate) paths: BTreeSet<PathBuf>,
     pub(crate) engine: Engine,
     pub(crate) html_rules: Vec<HtmlRule>,
 }
@@ -63,16 +63,20 @@ impl Filters {
         })
     }
 
-    pub(crate) const fn paths(&self) -> &BTreeSet<PathBuf> {
-        &self.paths
-    }
-
-    pub(crate) fn blocks(&self, url: &Url, source: &Url, request_type: RequestType) -> bool {
+    /// Whether a rule blocks `url` as any of `request_types`, or as the type of its extension when
+    /// `request_types` allows `Other`.
+    pub(crate) fn blocks(&self, url: &Url, source: &Url, request_types: &[RequestType]) -> bool {
         if !matches!(url.scheme(), "http" | "https") {
             return false;
         }
-        Request::new(url.as_str(), source.as_str(), request_type.as_str(), "GET")
-            .is_ok_and(|request| self.engine.check_network_request(&request).should_block())
+        // For an `http` or `https` URL, `Request::new` uses the type only to set `request_type`.
+        let Ok(mut request) = Request::new(url.as_str(), source.as_str(), "other", "GET") else {
+            return false;
+        };
+        with_path_type(request_types, url.path()).any(|request_type| {
+            request.request_type = request_type;
+            self.engine.check_network_request(&request).should_block()
+        })
     }
 
     /// `link` is relative to `base`, or to `page` when there is no base.
@@ -81,14 +85,14 @@ impl Filters {
         link: &str,
         base: Option<&Url>,
         page: Option<&Url>,
-        request_type: RequestType,
+        request_types: &[RequestType],
     ) -> bool {
         let absolute = match base.or(page) {
             Some(base) => base.join(link),
             None => Url::parse(link),
         };
         let Ok(absolute) = absolute else { return false };
-        self.blocks(&absolute, page.unwrap_or(&absolute), request_type)
+        self.blocks(&absolute, page.unwrap_or(&absolute), request_types)
     }
 }
 
@@ -136,3 +140,38 @@ impl fmt::Display for LoadError {
 }
 
 impl std::error::Error for LoadError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::links::PAGE_LINK_TYPES;
+
+    fn filters(list: &str) -> Filters {
+        Filters {
+            paths: BTreeSet::new(),
+            engine: Engine::new_with_list_text(list),
+            html_rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn blocks_reads_the_extension_from_the_path() {
+        let filters = filters("||example.mov^$media");
+        let url = |s| Url::parse(s).unwrap();
+        let video = url("https://example.mov/v.MP4?x=1");
+        assert!(filters.blocks(&video, &video, PAGE_LINK_TYPES));
+        let host = url("https://example.mov");
+        assert!(!filters.blocks(&host, &host, PAGE_LINK_TYPES));
+    }
+
+    #[test]
+    fn blocks_link_reads_the_extension_from_the_resolved_link() {
+        let filters = filters("||site.test/x.js$script");
+        let page = Url::parse("http://site.test/dir/page.html").unwrap();
+        let blocks = |link, types| filters.blocks_link(link, None, Some(&page), types);
+        assert!(blocks(" /x.js ", &[RequestType::Other]));
+        assert!(blocks("/x.j\ns", &[RequestType::Other]));
+        assert!(blocks("/x.js\t", &[RequestType::Other]));
+        assert!(!blocks("/x.js", &[RequestType::Image]));
+    }
+}

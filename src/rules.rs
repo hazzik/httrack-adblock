@@ -33,7 +33,7 @@ impl HtmlRule {
 }
 
 /// The domain list of a rule, such as `a.com,~b.a.com`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Domains {
     included: Vec<String>,
     excluded: Vec<String>,
@@ -41,10 +41,7 @@ pub(crate) struct Domains {
 
 impl Domains {
     pub(crate) fn parse(domains: &str) -> Self {
-        let mut parsed = Self {
-            included: Vec::new(),
-            excluded: Vec::new(),
-        };
+        let mut parsed = Self::default();
         for domain in domains.split(',').filter(|d| !d.is_empty()) {
             match domain.strip_prefix('~') {
                 Some(excluded) => parsed.excluded.push(excluded.to_owned()),
@@ -66,7 +63,10 @@ impl Domains {
 
 /// `site.*` matches `site` with any public suffix, such as `www.site.co.uk`.
 fn host_matches(host: &str, domain: &str) -> bool {
-    let is_or_under = |host: &str, domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    let is_or_under = |host: &str, domain: &str| {
+        host.strip_suffix(domain)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+    };
     match domain.strip_suffix(".*") {
         Some(entity) => without_public_suffix(host).is_some_and(|host| is_or_under(host, entity)),
         None => is_or_under(host, domain),
@@ -117,10 +117,7 @@ fn text_match(argument: &str) -> Option<TextMatch> {
 
 /// Returns `None` for operators other than `:has-text` and for CSS that `scraper` rejects.
 pub(crate) fn parse_html_rule(domains: &str, selector: &str) -> Option<HtmlRule> {
-    let (css, mut rest) = match selector.find(":has-text(") {
-        Some(i) => selector.split_at(i),
-        None => (selector, ""),
-    };
+    let (css, mut rest) = selector.split_at(selector.find(":has-text(").unwrap_or(selector.len()));
     let mut texts = Vec::new();
     while let Some(after) = rest.strip_prefix(":has-text(") {
         let (argument, after) = has_text_argument(after)?;
